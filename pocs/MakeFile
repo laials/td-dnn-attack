@@ -1,0 +1,14 @@
+CC      = gcc
+CFLAGS  = -O2 -I../tdxutils/
+TARGETS = attack1 attack
+
+all: $(TARGETS)
+
+attack1: 1-page-table-attack.c ../tdxutils/tdxutils.h
+	$(CC) $(CFLAGS) -o $@ $
+
+attack: 2-cldemote-attack.c ../tdxutils/tdxutils.h
+	$(CC) $(CFLAGS) -DHAVE_CLDEMOTE=1 -o $@ $
+
+clean:
+	rm -f $(TARGETS)
