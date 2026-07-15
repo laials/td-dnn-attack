@@ -1,0 +1,21 @@
+# Compiled attack binaries
+pocs/attack
+pocs/attack1
+
+# Shared library
+dnn-victim/libgpa_helper.so
+
+# Kernel module build artifacts
+tdxutils/*.o
+tdxutils/*.ko
+tdxutils/*.mod
+tdxutils/*.mod.c
+tdxutils/modules.order
+tdxutils/Module.symvers
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Result files
+*.txt
