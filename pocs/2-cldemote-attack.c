@@ -462,12 +462,16 @@ static int find_marker(unsigned long accessed, unsigned long *gpa,
     return -1;
 }
 
-static int is_start_marker(int idx) {
-    return idx == 1 || idx == 3 || idx == 5 || idx == 7;
+static int is_start_marker(int idx, const char *model) {
+    if (strcmp(model, "transformer") == 0)
+        return idx == 1 || idx == 3 || idx == 5 || idx == 7;
+    return idx == 1 || idx == 3 || idx == 5;
 }
 
-static int is_end_marker(int idx) {
-    return idx == 2 || idx == 4 || idx == 6 || idx == 8;
+static int is_end_marker(int idx, const char *model) {
+    if (strcmp(model, "transformer") == 0)
+        return idx == 2 || idx == 4 || idx == 6 || idx == 8;
+    return idx == 2 || idx == 4 || idx == 6;
 }
 
 static int matching_end_marker(int start_idx) {
@@ -580,7 +584,7 @@ int main(int argc, char *argv[]) {
         uint64_t llc_misses  = 0;
         uint64_t post_cycles = 0;
 
-        if (is_start_marker(idx)) {
+        if (is_start_marker(idx, model)) {
             // Gen 1: seat probe buffer in L3, record baseline.
             prepare_probe_buffer();
             baseline_probe_cycles = measure_probe_cycles();
@@ -603,7 +607,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (is_end_marker(idx) && counter_active) {
+        if (is_end_marker(idx, model) && counter_active) {
             // Gen 1: stop counters and re-measure probe buffer.
             stop_read_counters(&llc_refs, &llc_misses);
             counter_active   = 0;
