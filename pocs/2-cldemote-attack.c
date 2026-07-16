@@ -613,7 +613,9 @@ int main(int argc, char *argv[]) {
             counter_active   = 0;
             expected_end_idx = -1;
             post_cycles = measure_probe_cycles();
+        }
 
+        if (is_end_marker(idx, model) && last_weight_hpa) {
             // Gen 2: reload the same probe line we flushed at START.
             // Time how long it takes — slow = victim warmed that cache
             // set (HIT, bit=1), fast = victim never touched it (MISS, bit=0).
