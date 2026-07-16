@@ -105,6 +105,10 @@ termination = make_marker()
 # ---------------------------------------------------------------------------
 print("MODEL: NUMPY_CNN", flush=True)
 print_gpa("INPUT_X",          X)
+
+print_gpa("W1", W1)
+print_gpa("W2", W2)
+
 print_gpa("INFERENCE_START",  inf_start)
 print_gpa("CONV_START",       conv_start)
 print_gpa("CONV_END",         conv_end)
