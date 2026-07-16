@@ -65,6 +65,13 @@ termination = make_marker()
 print("MODEL: NUMPY_MINI_TRANSFORMER", flush=True)
 print_gpa("INPUT_X", X)
 
+print_gpa("Wq", Wq)
+print_gpa("Wk", Wk)
+print_gpa("Wv", Wv)
+print_gpa("Wff1", Wff1)
+print_gpa("Wff2", Wff2)
+print_gpa("Wout", Wout)
+
 print_gpa("INFERENCE_START", inf_start)
 print_gpa("QKV_START", qkv_start)
 print_gpa("QKV_END", qkv_end)
