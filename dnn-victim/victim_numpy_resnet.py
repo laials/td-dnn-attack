@@ -61,6 +61,12 @@ termination = make_marker()
 print("MODEL: NUMPY_TINY_RESNET", flush=True)
 print_gpa("INPUT_X", X)
 
+print_gpa("W1", W1)
+print_gpa("W2", W2)
+print_gpa("W3", W3)
+print_gpa("W4", W4)
+print_gpa("W5", W5)
+
 print_gpa("INFERENCE_START", inf_start)
 print_gpa("BLOCK1_START", block1_start)
 print_gpa("BLOCK1_END", block1_end)
