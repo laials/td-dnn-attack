@@ -76,6 +76,10 @@ print_func_gpa("fmaxf", libm.fmaxf)
 print_func_gpa("sgemm_", blas.sgemm_)
 
 print_gpa("Input x", x)
+print_gpa("W1", W1)
+print_gpa("W2", W2)
+print_gpa("W3", W3)
+
 print_gpa("Inference start marker", inference_start_marker)
 
 print_gpa("Layer 1 start marker", layer1_start_marker)
